@@ -85,10 +85,6 @@ SCRIPT_VERSION = "24"
 SCRIPT_LICENSE = "GPL"
 SCRIPT_DESC    = "Use the weechat nick colors in the chat area"
 
-# Based on the recommendations in RFC 7613. A valid nick is composed
-# of anything but " ,*?.!@".
-VALID_NICK = r'([@~&!%+-])?([^\s,\*?\.!@]+)'
-valid_nick_re = re.compile(VALID_NICK)
 ignore_channels = []
 ignore_nicks = []
 
@@ -159,25 +155,47 @@ def colorize_nick_color(nick, my_nick):
     else:
         return w.info_get('irc_nick_color', nick)
 
+def colorize_line(line, buffer):
+    ''' Colorize line for buffer and return it '''
+
+    global ignore_nicks, colored_nicks
+
+    if buffer not in colored_nicks:
+        return line
+
+    min_length = w.config_integer(colorize_config_option['min_nick_length'])
+    reset = w.color('reset')
+
+    for nick in sorted(colored_nicks[buffer], key = len, reverse=True):
+        if len(nick) < min_length or nick in ignore_nicks:
+            continue
+        nick_color = colored_nicks[buffer][nick]
+        # Based on the recommendations in RFC 7613, a valid nick is composed of
+        # anything but " ,*?.!@". Therefore, our regex finds the given nick
+        # from the channel with an optional symbol on the front/back and
+        # bordered by chracters in the set of " ,*?.!@". This prevents us from
+        # accidentally coloring substrings of other words that match this nick.
+        #
+        # Note that we use a double negative in the lookahead/lookbehind to
+        # account for line start/end. To match "preceded by 'a' or start of
+        # line", a lookbehind like (?<=(\A|a)) is not valid (due to not being
+        # fixed length) but a lookbehind of (?<![^a]) is.
+        line = re.sub(r'(?<![^\s,\*?\.!@])(\W|)%s(\W|)(?![^\s,\*?\.!@])' % re.escape(nick), r'\1%s%s%s\2' % (nick_color, nick, reset), line)
+
+    return line
+
 def colorize_cb(data, modifier, modifier_data, line):
     ''' Callback that does the colorizing, and returns new line if changed '''
 
-    global ignore_nicks, ignore_channels, colored_nicks
-
+    global ignore_channels
 
     full_name = modifier_data.split(';')[1]
     channel = '.'.join(full_name.split('.')[1:])
 
     buffer = w.buffer_search('', full_name)
-    # Check if buffer has colorized nicks
-    if buffer not in colored_nicks:
-        return line
 
     if channel and channel in ignore_channels:
         return line
-
-    min_length = w.config_integer(colorize_config_option['min_nick_length'])
-    reset = w.color('reset')
 
     # Don't colorize if the ignored tag is present in message
     tags_line = modifier_data.rsplit(';')
@@ -187,99 +205,24 @@ def colorize_cb(data, modifier, modifier_data, line):
             if i in tags_line:
                 return line
 
-    for words in valid_nick_re.findall(line):
-        nick = words[1]
-        # Check that nick is not ignored and longer than minimum length
-        if len(nick) < min_length or nick in ignore_nicks:
-            continue
-
-        # If the matched word is not a known nick, we try to match the
-        # word without its first or last character (if not a letter).
-        # This is necessary as "foo:" is a valid nick, which could be
-        # adressed as "foo::".
-        if nick not in colored_nicks[buffer]:
-            if not nick[-1].isalpha() and not nick[0].isalpha():
-                if nick[1:-1] in colored_nicks[buffer]:
-                    nick = nick[1:-1]
-            elif not nick[0].isalpha():
-                if nick[1:] in colored_nicks[buffer]:
-                    nick = nick[1:]
-            elif not nick[-1].isalpha():
-                if nick[:-1] in colored_nicks[buffer]:
-                    nick = nick[:-1]
-
-        # Check that nick is in the dictionary colored_nicks
-        if nick in colored_nicks[buffer]:
-            nick_color = colored_nicks[buffer][nick]
-
-            # Let's use greedy matching. Will check against every word in a line.
-            if w.config_boolean(colorize_config_option['greedy_matching']):
-                for word in line.split():
-                    if w.config_boolean(colorize_config_option['ignore_nicks_in_urls']) and \
-                          word.startswith(('http://', 'https://')):
-                        continue
-
-                    if nick in word:
-                        # Is there a nick that contains nick and has a greater lenght?
-                        # If so let's save that nick into var biggest_nick
-                        biggest_nick = ""
-                        for i in colored_nicks[buffer]:
-                            if nick in i and nick != i and len(i) > len(nick):
-                                if i in word:
-                                    # If a nick with greater len is found, and that word
-                                    # also happens to be in word, then let's save this nick
-                                    biggest_nick = i
-                        # If there's a nick with greater len, then let's skip this
-                        # As we will have the chance to colorize when biggest_nick
-                        # iterates being nick.
-                        if len(biggest_nick) > 0 and biggest_nick in word:
-                            pass
-                        elif len(word) < len(biggest_nick) or len(biggest_nick) == 0:
-                            new_word = word.replace(nick, '%s%s%s' % (nick_color, nick, reset))
-                            line = line.replace(word, new_word)
-            # Let's use lazy matching for nick
-            else:
-                nick_color = colored_nicks[buffer][nick]
-                # The two .? are in case somebody writes "nick:", "nick,", etc
-                # to address somebody
-                regex = r"(\A|\s).?(%s).?(\Z|\s)" % re.escape(nick)
-                match = re.search(regex, line)
-                if match is not None:
-                    new_line = line[:match.start(2)] + nick_color+nick+reset + line[match.end(2):]
-                    line = new_line
-    return line
+    return colorize_line(line, buffer)
 
 def colorize_input_cb(data, modifier, modifier_data, line):
     ''' Callback that does the colorizing in input '''
 
-    global ignore_nicks, ignore_channels, colored_nicks
-
-    min_length = w.config_integer(colorize_config_option['min_nick_length'])
+    global ignore_channels
 
     if not w.config_boolean(colorize_config_option['colorize_input']):
         return line
 
     buffer = w.current_buffer()
     # Check if buffer has colorized nicks
-    if buffer not in colored_nicks:
-        return line
 
     channel = w.buffer_get_string(buffer, 'name')
     if channel and channel in ignore_channels:
         return line
 
-    reset = w.color('reset')
-
-    for words in valid_nick_re.findall(line):
-        nick = words[1]
-        # Check that nick is not ignored and longer than minimum length
-        if len(nick) < min_length or nick in ignore_nicks:
-            continue
-        if nick in colored_nicks[buffer]:
-            nick_color = colored_nicks[buffer][nick]
-            line = line.replace(nick, '%s%s%s' % (nick_color, nick, reset))
-
-    return line
+    return colorize_line(line, buffer)
 
 def populate_nicks(*args):
     ''' Fills entire dict with all nicks weechat can see and what color it has
